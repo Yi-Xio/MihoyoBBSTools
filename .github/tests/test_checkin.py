@@ -163,7 +163,7 @@ def test_missing_os_cookie_is_not_reported_as_disabled(
 
     assert _run_script(monkeypatch, "actions_checkin.py", "run", str(tmp_path)) == 0
     assert json.loads((tmp_path / "accounts.json").read_text()) == [
-        {"alias": "账号 1", "status": 17},
+        {"alias": "账号 1", "status": 17, "details": ["国际服 · 缺少 Cookie"]},
     ]
 
 
@@ -189,6 +189,92 @@ def test_known_incomplete_task_cannot_be_hidden_by_another_success(
     assert worker.main() == (17 if missing_cloud_token else 11)
 
 
+def test_worker_exports_business_details_without_raw_account_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    account_config: Dict[str, object],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Keep recognized task results and discard nicknames and API payloads."""
+    worker = importlib.import_module("actions_account")
+    monkeypatch.setattr(config, "config", account_config)
+    caplog.set_level(logging.INFO)
+
+    def sign() -> Tuple[int, str]:
+        logging.info("正在进行「绝区零」签到")
+        logging.warning("绳匠「fixture-nickname」是第一次绑定米游社，请先手动签到一次")
+        return 0, (
+            "米游社: \n今天已经获得 60 个米游币\n目前有 1240 个米游币\n"
+            "原神: \nfixture-role-12345678已连续签到12天\n"
+            "今天获得的奖励是「摩拉」x5000\n"
+            "海外版：\n崩坏：星穹铁道：\n今天已经签到过\n"
+            '云原神:\n脚本签到失败，json 文本：{"cookie":"fixture-raw-token"}\n'
+            "签到成功，已获得 99 分钟免费时长"
+        )
+
+    monkeypatch.setattr(main, "main", sign)
+    details_file = tmp_path / "details.json"
+    assert worker.main(details_file) == 11
+    details = json.loads(details_file.read_text())
+    assert details == [
+        "米游社 · 今日获得 60 米游币，当前余额 1,240 米游币",
+        "原神 · 连续签到 12 天，今日奖励 摩拉 ×5,000",
+        "崩坏：星穹铁道（国际服） · 今日已签到",
+        "云原神 · 签到失败",
+        "绝区零 · 首次绑定，请手动签到一次",
+    ]
+
+
+def test_batch_retains_details_after_cleaning_up_the_account_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, account_config: Dict[str, object]
+) -> None:
+    """Pass back formatted details while keeping the per-account workspace temporary."""
+    detail = "原神 · 今日奖励 摩拉 ×5,000"
+
+    def run(args: List[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        details_file = Path(args[2])
+        assert details_file.parent != tmp_path
+        details_file.write_text(json.dumps([detail]), encoding="utf-8")
+        return subprocess.CompletedProcess(args, 10)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setenv("MIHOYO_ACCOUNTS", json.dumps([{"config": account_config}]))
+
+    assert _run_script(monkeypatch, "actions_checkin.py", "run", str(tmp_path)) == 0
+    assert json.loads((tmp_path / "accounts.json").read_text()) == [
+        {"alias": "账号 1", "status": 10, "details": [detail]},
+    ]
+    assert not any(entry.is_dir() for entry in tmp_path.iterdir())
+
+
+def test_worker_suppresses_overseas_error_text_that_looks_like_a_reward(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    account_config: Dict[str, object],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Do not interpret an upstream API error as a second successful game result."""
+    worker = importlib.import_module("actions_account")
+    monkeypatch.setattr(config, "config", account_config)
+    caplog.set_level(logging.INFO)
+
+    def sign() -> Tuple[int, str]:
+        raw_error = "接口拒绝\n原神：\n今天获得的奖励是：3x 「fixture-private-token」"
+        logging.info("海外版：")
+        logging.info("正在进行「原神」签到")
+        logging.error(raw_error)
+        logging.info("正在进行「崩坏：星穹铁道」签到")
+        return 0, f"海外版：\n\n原神：\n{raw_error}\n\n崩坏：星穹铁道：\n今天已经签到过"
+
+    monkeypatch.setattr(main, "main", sign)
+    details_file = tmp_path / "details.json"
+    assert worker.main(details_file) == 15
+    assert json.loads(details_file.read_text()) == [
+        "原神（国际服） · 签到失败",
+        "崩坏：星穹铁道（国际服） · 今日已签到",
+    ]
+
+
 @pytest.mark.parametrize(
     ("receipt", "first_status", "sent"),
     [
@@ -209,11 +295,17 @@ def test_telegram_and_public_summary(
     """Use the existing Telegram sender and publish only aggregate statuses."""
     summary = tmp_path / "summary.md"
     requests: List[httpx.Request] = []
+    native_statuses: List[int] = []
+    native_push = push.PushHandler.push
     (tmp_path / "accounts.json").write_text(
         json.dumps(
             [
                 {"alias": "fixture-private-alias", "status": first_status},
-                {"alias": "fixture-second-account", "status": 10},
+                {
+                    "alias": "fixture-second-account",
+                    "status": 10,
+                    "details": ["原神 · 连续签到 12 天，今日奖励 摩拉 ×5,000"],
+                },
             ]
         )
     )
@@ -232,16 +324,29 @@ def test_telegram_and_public_summary(
     def create_client() -> httpx.Client:
         return httpx.Client(transport=httpx.MockTransport(respond))
 
+    def send(handler: push.PushHandler, status_id: int, message: str) -> int:
+        native_statuses.append(status_id)
+        return native_push(handler, status_id, message)
+
     monkeypatch.setattr(push, "get_new_session", create_client)
+    monkeypatch.setattr(push.PushHandler, "push", send)
     notification_exit = _run_script(monkeypatch, "actions_notify.py", str(tmp_path))
     assert notification_exit == (0 if sent else 1)
     assert len(requests) == 1
     assert requests[0].url.path == "/botfixture-token/sendMessage"
     payload = parse_qs(requests[0].content.decode())
     assert payload["chat_id"] == ["1234567890"]
+    push_status = 0 if first_status == 10 else 2
+    assert native_statuses == [push_status]
     first_result = "已签到" if first_status == 10 else "凭据失效"
-    assert f"fixture-private-alias · {first_result}" in payload["text"][0]
-    assert "fixture-second-account · 已签到" in payload["text"][0]
+    message = payload["text"][0]
+    assert message.startswith(push.get_push_title(push_status))
+    assert f"fixture-private-alias · {first_result}" in message
+    assert (
+        "fixture-second-account\n原神 · 连续签到 12 天，今日奖励 摩拉 ×5,000" in message
+    )
+    assert "共 2 个账号，成功 " in message
+    assert not any(entry.is_dir() for entry in tmp_path.iterdir())
 
     summary_exit = _run_script(
         monkeypatch, "actions_checkin.py", "summary", str(tmp_path)

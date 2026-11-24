@@ -1,12 +1,22 @@
+from __future__ import annotations
+
 import logging
 import os
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING
 
 import httpx
 
 from actions_checkin import AccountStatus, batch_status, load_results
 from push import PushHandler
+
+if TYPE_CHECKING:
+    from typing import List
+
+    from actions_checkin import AccountResult
+
 
 STATUS_TEXT = {
     AccountStatus.DONE: "已签到",
@@ -28,40 +38,78 @@ def _check_receipt(response: httpx.Response) -> None:
         raise ValueError("Telegram did not accept the notification")
 
 
+def _notification_lines(results: List[AccountResult] | None) -> List[str]:
+    if results is None:
+        return ["签到结果待核实。"]
+    if not results:
+        return ["签到未执行，请检查账号配置。"]
+
+    lines: List[str] = []
+    for result in results:
+        status = AccountStatus(result["status"])
+        details = result.get("details", [])
+        label = result["alias"]
+        if status != AccountStatus.DONE or not details:
+            label += f" · {STATUS_TEXT[status]}"
+        lines.extend([label, *details, ""])
+
+    successful = sum(result["status"] == AccountStatus.DONE for result in results)
+    skipped = sum(result["status"] == AccountStatus.SKIPPED for result in results)
+    failed = len(results) - successful - skipped
+    summary = f"共 {len(results)} 个账号，成功 {successful} 个"
+    if skipped:
+        summary += f"，未执行 {skipped} 个"
+    if failed:
+        summary += f"，异常 {failed} 个"
+    lines.append(summary)
+    return lines
+
+
+def _push_status(results: List[AccountResult] | None) -> int:
+    if batch_status(results) == AccountStatus.DONE:
+        return 0
+    outcomes = {result["status"] for result in results or []}
+    if outcomes - {AccountStatus.DONE, AccountStatus.SKIPPED} == {
+        AccountStatus.CAPTCHA
+    }:
+        return 3
+    return 2 if AccountStatus.DONE in outcomes else 1
+
+
 def _send_notification(directory: Path, token: str, chat_id: str) -> None:
     results = load_results(directory)
-    lines = [
-        f"{result['alias']} · {STATUS_TEXT[AccountStatus(result['status'])]}"
-        for result in results or []
-    ]
-    if results is None:
-        lines = ["签到结果待核实。"]
-    elif not results:
-        lines = ["签到未执行，请检查账号配置。"]
-    status_id = 0 if batch_status(results) == AccountStatus.DONE else 1
-
-    handler = PushHandler()
-    handler.cfg.read_dict(
-        {
-            "telegram": {
-                "api_url": "api.telegram.org",
-                "bot_token": token,
-                "chat_id": chat_id,
+    status_id = _push_status(results)
+    with TemporaryDirectory(dir=directory) as config_dir:
+        config_path = Path(config_dir) / "push.ini"
+        handler = PushHandler(str(config_path))
+        if handler.get_config_path() != str(config_path):
+            raise ValueError("Unexpected push configuration path")
+        handler.cfg.read_dict(
+            {
+                "setting": {"enable": "true", "push_server": "telegram"},
+                "telegram": {
+                    "api_url": "api.telegram.org",
+                    "bot_token": token,
+                    "chat_id": chat_id,
+                },
             }
-        }
-    )
-    if not isinstance(handler.http, httpx.Client):
-        raise TypeError("Telegram requires HTTPX on the Actions runner")
+        )
+        with config_path.open("w", encoding="utf-8") as config_file:
+            handler.cfg.write(config_file)
+        if not isinstance(handler.http, httpx.Client):
+            raise TypeError("Telegram requires HTTPX on the Actions runner")
 
-    with handler.http as client:
-        client.event_hooks["response"].append(_check_receipt)
-        message = ""
-        for line in lines:
-            if len(message) + len(line) > 1800:
-                handler.telegram(status_id, message)
-                message = ""
-            message += f"{line}\n"
-        handler.telegram(status_id, message)
+        with handler.http as client:
+            client.event_hooks["response"].append(_check_receipt)
+            message = ""
+            for line in _notification_lines(results):
+                if len(message) + len(line) > 1800:
+                    if handler.push(status_id, message.rstrip()) != 0:
+                        raise ValueError("Telegram notification failed")
+                    message = ""
+                message += f"{line}\n"
+            if handler.push(status_id, message.rstrip()) != 0:
+                raise ValueError("Telegram notification failed")
 
 
 def main(directory: Path) -> int:

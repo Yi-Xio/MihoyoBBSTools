@@ -8,13 +8,13 @@ import sys
 import tempfile
 from enum import IntEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 import yaml
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from typing import List, Never
+    from typing import List, Never, Tuple, TypeGuard
 
 
 class AccountStatus(IntEnum):
@@ -35,6 +35,7 @@ class AccountResult(TypedDict):
 
     alias: str
     status: int
+    details: NotRequired[List[str]]
 
 
 SENSITIVE_FIELDS = {
@@ -64,6 +65,7 @@ def load_results(directory: Path) -> List[AccountResult] | None:
         and isinstance(item.get("alias"), str)
         and type(item.get("status")) is int
         and item["status"] in AccountStatus
+        and _is_detail_list(item.get("details", []))
         for item in result
     ):
         return None
@@ -109,12 +111,27 @@ def _reject_json_constant(value: str) -> Never:
     raise ValueError("Non-standard JSON number")
 
 
-def _run_account(configuration: Mapping[str, object], directory: Path) -> AccountStatus:
+def _is_detail_list(value: object) -> TypeGuard[List[str]]:
+    return isinstance(value, list) and all(isinstance(line, str) for line in value)
+
+
+def _read_account_details(details_file: Path) -> List[str]:
+    try:
+        details: object = json.loads(details_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return []
+    return details if _is_detail_list(details) else []
+
+
+def _run_account(
+    configuration: Mapping[str, object], directory: Path
+) -> Tuple[AccountStatus, List[str]]:
     project = Path(__file__).resolve().parents[2]
     worker = Path(__file__).with_name("actions_account.py")
     try:
         with tempfile.TemporaryDirectory(dir=directory) as config_directory:
             config_file = Path(config_directory) / "config.yaml"
+            details_file = Path(config_directory) / "details.json"
             config_file.write_text(
                 yaml.safe_dump(dict(configuration)), encoding="utf-8"
             )
@@ -131,7 +148,7 @@ def _run_account(configuration: Mapping[str, object], directory: Path) -> Accoun
                 }
             )
             result = subprocess.run(
-                [sys.executable, str(worker)],
+                [sys.executable, str(worker), str(details_file)],
                 cwd=project,
                 env=environment,
                 stdin=subprocess.DEVNULL,
@@ -140,14 +157,11 @@ def _run_account(configuration: Mapping[str, object], directory: Path) -> Accoun
                 timeout=ACCOUNT_TIMEOUT_SECONDS,
                 check=False,
             )
+            return AccountStatus(result.returncode), _read_account_details(details_file)
     except subprocess.TimeoutExpired:
-        return AccountStatus.TIMEOUT
+        return AccountStatus.TIMEOUT, []
     except (OSError, ValueError, yaml.YAMLError):
-        return AccountStatus.FAILED
-    try:
-        return AccountStatus(result.returncode)
-    except ValueError:
-        return AccountStatus.FAILED
+        return AccountStatus.FAILED, []
 
 
 def _checkin(directory: Path) -> int:
@@ -165,6 +179,7 @@ def _checkin(directory: Path) -> int:
         for number, account in enumerate(accounts, start=1):
             alias = f"账号 {number}"
             status = AccountStatus.CONFIG_ERROR
+            details: List[str] = []
             if isinstance(account, dict):
                 name = account.get("alias")
                 if isinstance(name, str) and name.strip():
@@ -176,8 +191,11 @@ def _checkin(directory: Path) -> int:
                     and type(configuration.get("version")) is int
                     and isinstance(configuration.get("account"), dict)
                 ):
-                    status = _run_account(configuration, directory)
-            results.append(AccountResult(alias=alias, status=status.value))
+                    status, details = _run_account(configuration, directory)
+            result = AccountResult(alias=alias, status=status.value)
+            if details:
+                result["details"] = details
+            results.append(result)
 
     (directory / "accounts.json").write_text(json.dumps(results), encoding="utf-8")
     return 0
