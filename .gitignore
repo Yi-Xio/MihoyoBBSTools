@@ -141,6 +141,8 @@ dmypy.json
 config/*.json
 config/*.yaml
 config/*.ini
+/MIHOYO_ACCOUNTS.txt
+/MIHOYO_ACCOUNTS.txt.tmp.*
 
 # push配置
 config/push.ini

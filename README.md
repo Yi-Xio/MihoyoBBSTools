@@ -1,3 +1,21 @@
+源项目：[MihoyoBBSTools](https://github.com/Womsxd/MihoyoBBSTools)
+
+做了如下修改：
+- 启用 Github Action 执行
+  - 使用 [MYS-Daily](https://github.com/MightyOwls/MYS-Daily.git) 项目获取 cookie、stoken、stuid、mid
+  - 将登陆凭证写入 ./config/xxx.yaml 中，一个账号一个配置，运行 ./set-mihoyo-accounts.sh 生成 Action 所需格式的登陆凭证 到 ./MIHOYO_ACCOUNTS.txt
+  - 仓库 Environment secrets 中创建并填写
+    - TELEGRAM_BOT_TOKEN: Telegram Notification Bot Token
+    - TELEGRAM_CHAT_ID: Telegram Notification Bot ID
+    - MIHOYO_ACCOUNTS: Action 所需格式的登陆凭证
+  - 运行 Action
+
+**声明**
+仅自用，总账号数不超过五个（这应当不算滥用吧 QAQ）
+对源项目开发者：若此修改令您感到不快，我对此表示非常抱歉，并请您联系我，我会及时按您的要求修改或删除项目
+
+---
+
 # 米游社辅助签到
 
 基于 Python3 的米游社辅助签到项目

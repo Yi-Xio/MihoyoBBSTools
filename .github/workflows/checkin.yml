@@ -1,0 +1,76 @@
+name: 米游社签到
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 23 * * *' # 北京时间 07:30
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mihoyo-checkin
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  checkin:
+    if: github.repository == 'Yi-Xio/MihoyoBBSTools' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    environment: mihoyo-checkin
+    timeout-minutes: 180
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '0.13.9'
+          enable-cache: false
+
+      - name: 准备运行环境
+        id: prepare
+        timeout-minutes: 10
+        run: |
+          uv venv --python 3.13
+          uv pip install -r requirements.txt
+          uv pip check
+          .venv/bin/python --version
+          mkdir -m 700 -- "${RUNNER_TEMP:?}/mihoyo-checkin"
+
+      - name: 逐账号签到
+        env:
+          MIHOYO_ACCOUNTS: ${{ secrets.MIHOYO_ACCOUNTS }}
+        run: |
+          umask 077
+          .venv/bin/python .github/scripts/actions_checkin.py run "$RUNNER_TEMP/mihoyo-checkin"
+
+      - name: 发送 Telegram 通知
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 3
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          umask 077
+          .venv/bin/python .github/scripts/actions_notify.py "$RUNNER_TEMP/mihoyo-checkin"
+
+      - name: 发布摘要
+        if: ${{ !cancelled() }}
+        env:
+          PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+        run: |
+          trap 'rm -rf -- "${RUNNER_TEMP:?}/mihoyo-checkin"' EXIT
+          if [[ "$PREPARE_OUTCOME" != success ]]; then
+            printf '%s\n\n%s\n' '## 米游社签到' '签到未执行 · Telegram 未执行' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          .venv/bin/python .github/scripts/actions_checkin.py summary "$RUNNER_TEMP/mihoyo-checkin"
