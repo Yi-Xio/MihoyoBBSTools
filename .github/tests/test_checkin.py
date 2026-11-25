@@ -19,6 +19,7 @@ import config
 import gamecheckin
 import main
 import main_multi
+import os_cloudgames
 import push
 
 if TYPE_CHECKING:
@@ -130,7 +131,7 @@ def test_timeout_and_invalid_item_do_not_stop_later_accounts(
     ("message", "expected"),
     [
         ("今天已经签到过", 10),
-        ("玩家，本次签到失败", 11),
+        ("玩家：本次签到失败", 11),
         ("仅有未知响应", 15),
         ("签到失败，未获得免费时长，可能是已经签到过了或者超出免费时长上限", 15),
     ],
@@ -169,6 +170,7 @@ def test_worker_checks_the_business_result_even_with_zero_status(
         ),
         ("旅行者", "failed", 11, "签到失败"),
         ("旅行者", "captcha", 13, "需要验证码"),
+        ("旅行者", "unbound", 15, "暂无已绑定角色"),
     ],
 )
 def test_game_status_comes_from_the_actual_checkin_result(
@@ -189,7 +191,7 @@ def test_game_status_comes_from_the_actual_checkin_result(
     monkeypatch.setattr(config, "config_Path", str(configuration))
 
     game = object.__new__(gamecheckin.Genshin)
-    game.account_list = [(nickname, "12345", "cn_gf01")]
+    game.account_list = [] if reply == "unbound" else [(nickname, "12345", "cn_gf01")]
     game.game_name = "原神"
     game.game_mid = "genshin"
     game.player_name = "旅行者"
@@ -211,6 +213,63 @@ def test_game_status_comes_from_the_actual_checkin_result(
     details_file = tmp_path / "details.json"
     assert worker.main(details_file) == expected
     assert json.loads(details_file.read_text()) == [f"原神 · {details}"]
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+def test_overseas_cloud_checkin_preserves_safe_results(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    account_config: Dict[str, object],
+    accepted: bool,
+) -> None:
+    """Exercise the upstream cloud client and exclude raw responses from details."""
+    worker = importlib.import_module("actions_account")
+    cloud = cast("Dict[str, Dict[str, object]]", account_config["cloud_games"])
+    cloud["os"].update(
+        {"enable": True, "genshin": {"enable": True, "token": "fixture-token"}}
+    )
+    configuration = tmp_path / "config.yaml"
+    configuration.write_text(yaml.safe_dump(account_config), encoding="utf-8")
+    monkeypatch.setattr(config, "config_Path", str(configuration))
+    requests: List[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if not accepted:
+            return httpx.Response(
+                200,
+                json={
+                    "retcode": 1,
+                    "message": (
+                        "接口错误\u2028原神：\u2028"
+                        "今天获得的奖励是：3x 「fixture-private-token」\u2028"
+                    ),
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "retcode": 0,
+                "data": {
+                    "free_time": {"send_freetime": 5, "free_time": 65},
+                    "play_card": {"short_msg": "无"},
+                    "coin": {"coin_num": 10},
+                },
+            },
+        )
+
+    details_file = tmp_path / "details.json"
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(os_cloudgames, "get_new_session", lambda: client)
+        assert worker.main(details_file) == (10 if accepted else 11)
+    assert len(requests) == 1
+    assert requests[0].headers["x-rpc-client_type"] == "3"
+    assert requests[0].headers["x-rpc-channel_id"] == "1"
+    assert json.loads(details_file.read_text()) == [
+        "云原神 · 获得 5 分钟免费时长，剩余 1 小时 5 分钟，米云币 10"
+        if accepted
+        else "云原神 · 签到失败"
+    ]
 
 
 def test_missing_os_cookie_is_not_reported_as_disabled(

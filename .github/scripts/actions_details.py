@@ -19,6 +19,7 @@ GAME_NAMES = {
     "绝区零",
 }
 TASK_NAMES = GAME_NAMES | {"米游社", "云原神", "云绝区零"}
+UNBOUND_GAMES = {f"{game}：并没有绑定任何{game}账号": game for game in GAME_NAMES}
 TASK_STARTED = re.compile(r"正在进行「(.+)」签到")
 CONSECUTIVE_DAYS = re.compile(r".{0,80}已连续签到\s*([0-9]{1,5})\s*天")
 REWARD_NAME = r"[\u4e00-\u9fffA-Za-z0-9 ·・（）()'’\-]{1,40}"
@@ -28,6 +29,7 @@ COIN_COUNT = re.compile(
     r"(一共获得|今天已经获得|还能获得|目前有) ([0-9]{1,9}) 个米游币"
 )
 CLOUD_GAIN = re.compile(r"签到成功，已获得 ([0-9]{1,6}) 分钟免费时长")
+CLOUD_ERROR_PREFIX = "脚本签到失败，json 文本："
 UNCERTAIN_CLOUD_RESULT = (
     "签到失败，未获得免费时长，可能是已经签到过了或者超出免费时长上限"
 )
@@ -47,13 +49,15 @@ def started_game(message: str) -> str | None:
 
 
 def parse_report(
-    message: str, overseas_errors: Mapping[str, str]
+    message: str, overseas_errors: Mapping[str, str], cloud_errors: List[str]
 ) -> Tuple[Set[AccountStatus], List[str]]:
     """Recognize business outcomes and format the same fields for the private chat."""
     # Upstream includes each overseas API error verbatim after its game heading.
     for game, raw_error in overseas_errors.items():
         heading = f"\n{game}：\n"
         message = message.replace(f"{heading}{raw_error}", f"{heading}本次签到失败", 1)
+    for raw_error in cloud_errors:
+        message = message.replace(raw_error, CLOUD_ERROR_PREFIX)
 
     report: List[Tuple[str, List[str]]] = []
     outcomes: Set[AccountStatus] = set()
@@ -62,21 +66,23 @@ def parse_report(
     task = ""
     for raw in message.splitlines():
         line = raw.strip()
-        if line.endswith((":", "：")):
-            heading = line[:-1]
-            if heading == "海外版":
-                overseas = True
-                task = ""
+        unbound_game = UNBOUND_GAMES.get(line)
+        heading = unbound_game or (line[:-1] if line.endswith((":", "：")) else "")
+        if heading == "海外版":
+            overseas = True
+            task = ""
+            continue
+        if heading in TASK_NAMES:
+            task = heading
+            name = f"{task}（国际服）" if overseas and task in GAME_NAMES else task
+            report.append((name, []))
+            discard_response = False
+            if not unbound_game:
                 continue
-            if heading in TASK_NAMES:
-                task = heading
-                name = f"{task}（国际服）" if overseas and task in GAME_NAMES else task
-                report.append((name, []))
-                discard_response = False
-                continue
+            line = f"并没有绑定任何{task}账号"
         if discard_response:
             continue
-        if line.startswith("脚本签到失败，json 文本："):
+        if line.startswith(CLOUD_ERROR_PREFIX):
             outcomes.add(AccountStatus.FAILED)
             if task:
                 report[-1][1].append("签到失败")
@@ -137,13 +143,15 @@ def _detail(task: str, line: str) -> Tuple[str | None, AccountStatus | None]:
             return f"{duration}，{balance[3]} {int(balance[4]):,}", None
     if line == "今天已经签到过":
         return "今日已签到", AccountStatus.DONE
+    if task in GAME_NAMES and line == "签到成功":
+        return None, AccountStatus.DONE
     if line == "请手动签到一次":
         return "首次绑定，请手动签到一次", AccountStatus.FAILED
     if line == f"并没有绑定任何{task}账号":
         return "暂无已绑定角色", AccountStatus.UNVERIFIED
-    if line.endswith("，触发验证码，本次签到失败"):
+    if line.endswith("：触发验证码，本次签到失败"):
         return "需要验证码", AccountStatus.CAPTCHA
-    if line.endswith("，本次签到失败") or line in {
+    if line.endswith("：本次签到失败") or line in {
         "本次签到失败",
         "脚本签到发生异常，请查看日志",
     }:

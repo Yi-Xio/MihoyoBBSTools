@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import config
 import main as checkin
 from actions_checkin import AccountStatus
-from actions_details import parse_report, started_game
+from actions_details import CLOUD_ERROR_PREFIX, parse_report, started_game
 from error import CookieError, StokenError
 
 if TYPE_CHECKING:
@@ -28,6 +28,7 @@ class TaskSignals(logging.Handler):
         self.manual_games: List[str] = []
         self.overseas = False
         self.overseas_errors: Dict[str, str] = {}
+        self.cloud_errors: List[str] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         """Recognize incomplete outcomes that upstream only records in logs."""
@@ -47,6 +48,8 @@ class TaskSignals(logging.Handler):
             self.current_game = game
         elif message == "国际服未配置 Cookie！":
             self.missing_cookie = True
+        elif message.startswith(CLOUD_ERROR_PREFIX):
+            self.cloud_errors.append(message)
         elif message.endswith("，请先手动签到一次"):
             game = self.current_game or "游戏签到"
             if game not in self.manual_games:
@@ -70,7 +73,9 @@ def main(details_file: Path | None = None) -> AccountStatus:
         logging.getLogger().removeHandler(signals)
         logging.getLogger("AutoMihoyoBBS").removeHandler(signals)
 
-    outcomes, details = parse_report(message or "", signals.overseas_errors)
+    outcomes, details = parse_report(
+        message or "", signals.overseas_errors, signals.cloud_errors
+    )
     outcome = _account_status(status, bool(message), outcomes, signals)
     if details_file is not None and outcome != AccountStatus.SKIPPED:
         details.extend(
