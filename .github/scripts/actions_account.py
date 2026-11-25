@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -10,15 +9,12 @@ from typing import TYPE_CHECKING
 import config
 import main as checkin
 from actions_checkin import AccountStatus
-from actions_details import notification_details, started_game
+from actions_details import parse_report, started_game
 from error import CookieError, StokenError
 
 if TYPE_CHECKING:
+    from collections.abc import Set
     from typing import Dict, List
-
-UNCERTAIN_CLOUD_RESULT = (
-    "签到失败，未获得免费时长，可能是已经签到过了或者超出免费时长上限"
-)
 
 
 class TaskSignals(logging.Handler):
@@ -74,9 +70,9 @@ def main(details_file: Path | None = None) -> AccountStatus:
         logging.getLogger().removeHandler(signals)
         logging.getLogger("AutoMihoyoBBS").removeHandler(signals)
 
-    outcome = _account_status(status, message or "", signals)
+    outcomes, details = parse_report(message or "", signals.overseas_errors)
+    outcome = _account_status(status, bool(message), outcomes, signals)
     if details_file is not None and outcome != AccountStatus.SKIPPED:
-        details = notification_details(message or "", signals.overseas_errors)
         details.extend(
             f"{game} · 首次绑定，请手动签到一次" for game in signals.manual_games
         )
@@ -91,39 +87,36 @@ def main(details_file: Path | None = None) -> AccountStatus:
     return outcome
 
 
-def _account_status(status: int, message: str, signals: TaskSignals) -> AccountStatus:
+def _account_status(
+    status: int, has_report: bool, outcomes: Set[AccountStatus], signals: TaskSignals
+) -> AccountStatus:
     if not config.config["enable"]:
         return AccountStatus.SKIPPED
-    if status == checkin.StatusCode.CAPTCHA_TRIGGERED.value:
+    if AccountStatus.CAPTCHA in outcomes:
         return AccountStatus.CAPTCHA
-    if status != checkin.StatusCode.SUCCESS.value:
+    # Upstream also derives its CAPTCHA exit status from the unparsed message.
+    if status not in (
+        checkin.StatusCode.SUCCESS.value,
+        checkin.StatusCode.CAPTCHA_TRIGGERED.value,
+    ):
         return AccountStatus.FAILED
 
-    if "token 失效" in message:
+    if AccountStatus.CREDENTIALS in outcomes:
         return AccountStatus.CREDENTIALS
     if signals.missing_cookie or _cloud_token_missing():
         return AccountStatus.CONFIG_ERROR
-    confirmed = message.replace(UNCERTAIN_CLOUD_RESULT, "")
-    if signals.manual_games or any(
-        text in confirmed for text in ("失败", "签到发生异常", "请手动签到一次")
-    ):
+    if signals.manual_games or AccountStatus.FAILED in outcomes:
         return AccountStatus.FAILED
     web_activity = config.config["web_activity"]
     if (
         signals.error
-        or UNCERTAIN_CLOUD_RESULT in message
+        or AccountStatus.UNVERIFIED in outcomes
         or (web_activity["enable"] and web_activity["activities"])
     ):
         return AccountStatus.UNVERIFIED
-    if not message:
+    if not has_report:
         return _empty_result()
-    if "没有绑定任何" in message or re.search(r"还能获得 [1-9]\d* 个米游币", message):
-        return AccountStatus.UNVERIFIED
-    if re.search(
-        r"已经签到过|已连续签到\s*\d+\s*天|今天获得的奖励是|签到成功，已获得"
-        r"|今天已经全部完成了|还能获得 0 个米游币",
-        message,
-    ):
+    if AccountStatus.DONE in outcomes:
         return AccountStatus.DONE
     return AccountStatus.UNVERIFIED
 

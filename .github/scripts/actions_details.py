@@ -3,9 +3,11 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from actions_checkin import AccountStatus
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from typing import List, Tuple
+    from typing import List, Set, Tuple
 
 
 GAME_NAMES = {
@@ -26,6 +28,9 @@ COIN_COUNT = re.compile(
     r"(一共获得|今天已经获得|还能获得|目前有) ([0-9]{1,9}) 个米游币"
 )
 CLOUD_GAIN = re.compile(r"签到成功，已获得 ([0-9]{1,6}) 分钟免费时长")
+UNCERTAIN_CLOUD_RESULT = (
+    "签到失败，未获得免费时长，可能是已经签到过了或者超出免费时长上限"
+)
 CLOUD_BALANCE = re.compile(
     r"你当前拥有免费时长 ([0-9]{1,5}) 小时 ([0-9]{1,2}) 分钟，"
     r"畅玩卡状态为 .+，拥有(米云币|邦邦点) ([0-9]{1,9}) 枚"
@@ -41,14 +46,17 @@ def started_game(message: str) -> str | None:
     return name if name in GAME_NAMES else None
 
 
-def notification_details(message: str, overseas_errors: Mapping[str, str]) -> List[str]:
-    """Format known business fields from the upstream report for the private chat."""
+def parse_report(
+    message: str, overseas_errors: Mapping[str, str]
+) -> Tuple[Set[AccountStatus], List[str]]:
+    """Recognize business outcomes and format the same fields for the private chat."""
     # Upstream includes each overseas API error verbatim after its game heading.
     for game, raw_error in overseas_errors.items():
         heading = f"\n{game}：\n"
         message = message.replace(f"{heading}{raw_error}", f"{heading}本次签到失败", 1)
 
     report: List[Tuple[str, List[str]]] = []
+    outcomes: Set[AccountStatus] = set()
     overseas = False
     discard_response = False
     task = ""
@@ -66,26 +74,32 @@ def notification_details(message: str, overseas_errors: Mapping[str, str]) -> Li
                 report.append((name, []))
                 discard_response = False
                 continue
-        if not task or discard_response:
+        if discard_response:
             continue
         if line.startswith("脚本签到失败，json 文本："):
-            report[-1][1].append("签到失败")
+            outcomes.add(AccountStatus.FAILED)
+            if task:
+                report[-1][1].append("签到失败")
             discard_response = True
             continue
-        detail = _detail(task, line)
-        if detail:
+        detail, outcome = _detail(task, line)
+        if overseas and task in overseas_errors and line == "本次签到失败":
+            outcome = AccountStatus.UNVERIFIED
+        if outcome is not None:
+            outcomes.add(outcome)
+        if task and detail:
             name, parts = report[-1]
             if detail.startswith("连续签到 ") and parts:
                 report.append((name, [detail]))
             else:
                 parts.append(detail)
-    return [f"{name} · {'，'.join(parts)}" for name, parts in report if parts]
+    return outcomes, [f"{name} · {'，'.join(parts)}" for name, parts in report if parts]
 
 
-def _detail(task: str, line: str) -> str | None:
-    if task == "米游社":
+def _detail(task: str, line: str) -> Tuple[str | None, AccountStatus | None]:
+    if task in {"米游社", ""}:
         if line == "今天已经全部完成了！":
-            return "今日任务已完成"
+            return "今日任务已完成", AccountStatus.DONE
         count = COIN_COUNT.fullmatch(line)
         if count:
             label = {
@@ -94,38 +108,46 @@ def _detail(task: str, line: str) -> str | None:
                 "还能获得": "还能获得",
                 "目前有": "当前余额",
             }[count[1]]
-            return f"{label} {int(count[2]):,} 米游币"
-    if task in GAME_NAMES:
+            amount = int(count[2])
+            outcome = None
+            if count[1] == "还能获得":
+                outcome = AccountStatus.UNVERIFIED if amount else AccountStatus.DONE
+            return f"{label} {amount:,} 米游币", outcome
+    if not task or task in GAME_NAMES:
         days = CONSECUTIVE_DAYS.fullmatch(line)
         if days:
-            return f"连续签到 {int(days[1])} 天"
+            return f"连续签到 {int(days[1])} 天", AccountStatus.DONE
         cn = CN_REWARD.fullmatch(line)
         if cn:
-            return f"今日奖励 {cn[1]} ×{int(cn[2]):,}"
+            return f"今日奖励 {cn[1]} ×{int(cn[2]):,}", AccountStatus.DONE
         os_reward = OS_REWARD.fullmatch(line)
         if os_reward:
-            return f"今日奖励 {os_reward[2]} ×{int(os_reward[1]):,}"
-    if task in {"云原神", "云绝区零"}:
+            return f"今日奖励 {os_reward[2]} ×{int(os_reward[1]):,}", AccountStatus.DONE
+        if re.fullmatch(r"今天获得的奖励是(?:「.+」x[0-9]+|：[0-9]+x 「.+」)", line):
+            return None, AccountStatus.DONE
+    if task in {"云原神", "云绝区零", ""}:
+        if line == UNCERTAIN_CLOUD_RESULT:
+            return None, AccountStatus.UNVERIFIED
         gain = CLOUD_GAIN.fullmatch(line)
         if gain:
-            return f"获得 {int(gain[1])} 分钟免费时长"
+            return f"获得 {int(gain[1])} 分钟免费时长", AccountStatus.DONE
         balance = CLOUD_BALANCE.fullmatch(line)
         if balance:
             duration = f"剩余 {int(balance[1])} 小时 {int(balance[2])} 分钟"
-            return f"{duration}，{balance[3]} {int(balance[4]):,}"
+            return f"{duration}，{balance[3]} {int(balance[4]):,}", None
     if line == "今天已经签到过":
-        return "今日已签到"
+        return "今日已签到", AccountStatus.DONE
     if line == "请手动签到一次":
-        return "首次绑定，请手动签到一次"
+        return "首次绑定，请手动签到一次", AccountStatus.FAILED
     if line == f"并没有绑定任何{task}账号":
-        return "暂无已绑定角色"
+        return "暂无已绑定角色", AccountStatus.UNVERIFIED
     if line.endswith("，触发验证码，本次签到失败"):
-        return "需要验证码"
+        return "需要验证码", AccountStatus.CAPTCHA
     if line.endswith("，本次签到失败") or line in {
         "本次签到失败",
         "脚本签到发生异常，请查看日志",
     }:
-        return "签到失败"
+        return "签到失败", AccountStatus.FAILED
     if line in {"token 失效/防沉迷", "云原神 token 失效"}:
-        return "凭据异常"
-    return None
+        return "凭据异常", AccountStatus.CREDENTIALS
+    return None, None

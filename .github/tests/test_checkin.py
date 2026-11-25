@@ -16,6 +16,7 @@ import pytest
 import yaml
 
 import config
+import gamecheckin
 import main
 import main_multi
 import push
@@ -149,6 +150,67 @@ def test_worker_checks_the_business_result_even_with_zero_status(
 
     monkeypatch.setattr(main, "main", sign)
     assert worker.main() == expected
+
+
+@pytest.mark.parametrize(
+    ("nickname", "reply", "expected", "details"),
+    [
+        (
+            "失败的旅行者",
+            "already_signed",
+            10,
+            "连续签到 12 天，今日奖励 摩拉 ×5,000",
+        ),
+        (
+            "触发验证码的旅行者",
+            "already_signed",
+            10,
+            "连续签到 12 天，今日奖励 摩拉 ×5,000",
+        ),
+        ("旅行者", "failed", 11, "签到失败"),
+        ("旅行者", "captcha", 13, "需要验证码"),
+    ],
+)
+def test_game_status_comes_from_the_actual_checkin_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    account_config: Dict[str, object],
+    nickname: str,
+    reply: str,
+    expected: int,
+    details: str,
+) -> None:
+    """Distinguish real failures and captcha challenges from nicknames."""
+    worker = importlib.import_module("actions_account")
+    games = cast("Dict[str, Dict[str, object]]", account_config["games"])
+    games["cn"]["enable"] = True
+    configuration = tmp_path / "config.yaml"
+    configuration.write_text(yaml.safe_dump(account_config), encoding="utf-8")
+    monkeypatch.setattr(config, "config_Path", str(configuration))
+
+    game = object.__new__(gamecheckin.Genshin)
+    game.account_list = [(nickname, "12345", "cn_gf01")]
+    game.game_name = "原神"
+    game.game_mid = "genshin"
+    game.player_name = "旅行者"
+    game.checkin_rewards = [{"name": "摩拉", "cnt": 5000}] * 12
+    monkeypatch.setattr(gamecheckin, "Genshin", lambda: game)
+    monkeypatch.setattr(gamecheckin.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        game,
+        "is_sign",
+        lambda **_kwargs: {"total_sign_day": 12, "is_sign": reply == "already_signed"},
+    )
+    response = (
+        httpx.Response(200, json={"retcode": 1, "data": {"success": 1}})
+        if reply == "captcha"
+        else None
+    )
+    monkeypatch.setattr(game, "check_in", lambda _account: response)
+
+    details_file = tmp_path / "details.json"
+    assert worker.main(details_file) == expected
+    assert json.loads(details_file.read_text()) == [f"原神 · {details}"]
 
 
 def test_missing_os_cookie_is_not_reported_as_disabled(
