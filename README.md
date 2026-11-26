@@ -10,12 +10,7 @@
       - TELEGRAM_CHAT_ID: Telegram Notification Chat ID
       - MIHOYO_ACCOUNTS: Action 所需格式的登陆凭证
     - 运行 Action
-  - 思考
-    - Action 复用上游的签到逻辑，自行编排多账号执行
-    - 从 Secret 生成每个账号的临时 YAML，再启动独立子进程调用上游 main.main()。登录、米游社任务和游戏签到都由上游模块执行
-    - 每个账号独立进程、最多 4 分钟，一个账号失败后继续跑其余账号
-    - 为何不用上游的入口 main_multi.py？
-      - 上游 main_multi.py 在同一个进程中循环，只捕获 Cookie 和 Stoken 异常。其他未捕获的异常会打断批次。正常跑完整批后，它还固定以 0 退出，即使汇总里有失败，GitHub 也无法单靠退出码判断
+    - 每个账号由独立的 GitHub Actions Job 执行 `main.py`，Telegram 通知由上游程序直接发送。[配置与运行说明](.github/checkin.md)
 
 **声明**
 仅自用，总账号数不超过五个（这应当不算滥用吧 QAQ）

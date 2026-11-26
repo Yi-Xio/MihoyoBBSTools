@@ -17,13 +17,36 @@ defaults:
     shell: bash
 
 jobs:
-  checkin:
+  build-matrix:
     if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     environment: mihoyo-checkin
-    timeout-minutes: 180
-    env:
-      PYTHONPATH: ${{ github.workspace }}
+    timeout-minutes: 5
+    outputs:
+      accounts: ${{ steps.matrix.outputs.accounts }}
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 生成账号矩阵
+        id: matrix
+        env:
+          MIHOYO_ACCOUNTS: ${{ secrets.MIHOYO_ACCOUNTS }}
+        run: python3 .github/scripts/actions_checkin.py
+
+  account:
+    name: '米游社账号 #${{ matrix.account }}'
+    needs: build-matrix
+    runs-on: ubuntu-24.04
+    environment: mihoyo-checkin
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        account: ${{ fromJSON(needs.build-matrix.outputs.accounts) }}
     steps:
       - name: 检出源码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,40 +60,36 @@ jobs:
           enable-cache: false
 
       - name: 准备运行环境
-        id: prepare
         timeout-minutes: 10
         run: |
           uv venv --python 3.13
           uv pip install -r requirements.txt
           uv pip check
           .venv/bin/python --version
-          mkdir -m 700 -- "${RUNNER_TEMP:?}/mihoyo-checkin"
 
-      - name: 逐账号签到
+      - name: 执行上游签到和推送
+        id: checkin
+        timeout-minutes: 5
         env:
+          ACCOUNT_INDEX: ${{ matrix.account }}
           MIHOYO_ACCOUNTS: ${{ secrets.MIHOYO_ACCOUNTS }}
-        run: |
-          umask 077
-          .venv/bin/python .github/scripts/actions_checkin.py run "$RUNNER_TEMP/mihoyo-checkin"
-
-      - name: 发送 Telegram 通知
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
-        timeout-minutes: 3
-        env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           umask 077
-          .venv/bin/python .github/scripts/actions_notify.py "$RUNNER_TEMP/mihoyo-checkin"
+          .venv/bin/python .github/scripts/actions_account.py "$ACCOUNT_INDEX"
 
       - name: 发布摘要
         if: ${{ !cancelled() }}
         env:
-          PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+          ACCOUNT_STATUS: ${{ steps.checkin.outputs.status }}
+          ACCOUNT_OUTCOME: ${{ steps.checkin.outcome }}
         run: |
-          trap 'rm -rf -- "${RUNNER_TEMP:?}/mihoyo-checkin"' EXIT
-          if [[ "$PREPARE_OUTCOME" != success ]]; then
-            printf '%s\n\n%s\n' '## 米游社签到' '签到未执行 · Telegram 未执行' >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          .venv/bin/python .github/scripts/actions_checkin.py summary "$RUNNER_TEMP/mihoyo-checkin"
+          case "$ACCOUNT_STATUS:$ACCOUNT_OUTCOME" in
+            completed:success) result='执行结束' ;;
+            timed-out:failure) result='执行超时' ;;
+            config-error:failure) result='未执行（配置无效）' ;;
+            *:skipped) result='未执行（环境准备失败）' ;;
+            *) result='进程异常' ;;
+          esac
+          printf '%s\n\n%s\n' '### 签到执行' "$result" >> "$GITHUB_STEP_SUMMARY"
